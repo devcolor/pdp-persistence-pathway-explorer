@@ -1,0 +1,62 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.core.errors import register_exception_handlers
+from app.uncf import uncf_router
+
+
+def analysis_v2_runtime_factory():
+    """Use the configured source even when chat/provider routes are disabled."""
+    from app.services.analytics import get_service
+
+    return get_service
+
+
+def create_app() -> FastAPI:
+    """The local API: the Explorer's endpoints and v2 analyses, plus chat when enabled."""
+    app = FastAPI(
+        title=settings.PROJECT_NAME,
+        version=settings.VERSION,
+        openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
+        docs_url=settings.docs_path,
+        redoc_url=None,
+        # Hides the docs page's long Schemas list. Each endpoint still shows its own shapes.
+        swagger_ui_parameters={"defaultModelsExpandDepth": -1},
+    )
+
+    register_exception_handlers(app)
+
+    if settings.CORS_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.CORS_ORIGINS,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    app.include_router(uncf_router(), prefix=settings.API_V1_PREFIX)
+    from api.analysis_v2 import get_runtime_factory
+    from api.analysis_v2 import router as analysis_v2_router
+
+    app.include_router(analysis_v2_router)
+    app.dependency_overrides[get_runtime_factory] = analysis_v2_runtime_factory
+    if settings.UNCF_CHAT_ENABLED:
+        from api.analyses import get_service as default_service
+        from api.analyses import router as analytics_router
+
+        from app.chat.routes import router as chat_router
+        from app.services.analytics import get_service
+
+        app.dependency_overrides[default_service] = get_service
+        app.include_router(analytics_router)
+        app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
+        app.include_router(
+            chat_router, prefix=f"{settings.API_V1_PREFIX}/uncf", include_in_schema=False
+        )
+
+    return app
+
+
+app = create_app()

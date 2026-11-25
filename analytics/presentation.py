@@ -1,0 +1,46 @@
+"""Calculation text shared by browser and model."""
+
+from analytics.schemas import CalculationRow
+from analytics.disclosure import has_small_cell, suppress_legacy as suppress
+
+__all__ = ["rate_row", "has_small_cell", "suppress"]
+
+
+def rate_row(
+    label: str,
+    numerator: int,
+    denominator: int,
+    *,
+    kind="rate",
+    exclusions=None,
+    note="",
+    group=None,
+    horizon=None,
+    provisional=False,
+    unknown_reason="no_known_outcomes",
+) -> CalculationRow:
+    """Build a rate only when an eligible known population exists."""
+    if denominator == 0:
+        return CalculationRow(
+            label=label,
+            kind=kind,
+            group=group or {},
+            horizon=horizon,
+            status="unknown",
+            reason=unknown_reason,
+            note=note or "No eligible known outcomes; this is not a zero rate.",
+        )
+    rate = round(numerator / denominator, 4)
+    return CalculationRow(
+        label=label,
+        kind=kind,
+        group=group or {},
+        horizon=horizon,
+        status="provisional" if provisional else "ok",
+        numerator=numerator,
+        denominator=denominator,
+        rate=rate,
+        exclusions=exclusions or {},
+        note=note,
+        calculation=f"{numerator} / {denominator} = {rate:.2%}",
+    )

@@ -1,0 +1,86 @@
+# Toolchain and day-to-day commands for Playground.
+#   mise install      install the pinned tools below
+#   mise tasks        list every command
+#   mise run <task>   run one, e.g. `mise run api:dev`
+
+[tools]
+bun = "1.4.3"      # client_application: package manager and script runner
+node = "24.22.2"   # client_application: runtime Next.js tooling expects alongside bun
+python = "3.14.10" # server_application: matches server_application/.python-version
+uv = "0.13.7"      # server_application: dependencies, virtualenv, lockfile
+
+# --- server_application ----------------------------------------------------------------
+
+[tasks."api:install"]
+description = "Install backend dependencies with uv"
+dir = "server_application"
+run = "uv sync"
+
+[tasks."api:load"]
+description = "Build the SQLite extract the Explorer and chat read (normalized-data-model/output/pdp.sqlite)"
+dir = ".."
+run = "uv run --project playground/server_application python -m api load"
+
+[tasks."api:dev"]
+description = "Run the API with auto-reload on http://localhost:8000 (run api:load once first)"
+dir = "server_application"
+run = "uv run fastapi dev app/main.py"
+
+[tasks."api:test"]
+description = "Run backend tests"
+dir = "server_application"
+run = "uv run pytest"
+
+[tasks."api:lint"]
+description = "Lint and check formatting of backend code"
+dir = "server_application"
+run = ["uv run ruff check .", "uv run ruff format --check ."]
+
+[tasks."api:format"]
+description = "Auto-fix lint issues and format backend code"
+dir = "server_application"
+run = ["uv run ruff check --fix .", "uv run ruff format ."]
+
+# --- client_application ---------------------------------------------------------------
+
+[tasks."web:install"]
+description = "Install frontend dependencies with bun"
+dir = "client_application"
+run = "bun install"
+
+[tasks."web:dev"]
+description = "Run the web app with hot reload on http://localhost:3000"
+dir = "client_application"
+run = "bun run dev"
+
+[tasks."web:build"]
+description = "Production build (use web:build-staging for staging)"
+dir = "client_application"
+run = "bun run build"
+
+[tasks."web:build-staging"]
+description = "Staging build (NEXT_PUBLIC_APP_ENV=staging)"
+dir = "client_application"
+run = "bun run build:staging"
+
+[tasks."web:start"]
+description = "Serve the last build on http://localhost:3000"
+dir = "client_application"
+run = "bun run start"
+
+[tasks."web:lint"]
+description = "Lint and type-check frontend code"
+dir = "client_application"
+run = ["bun run lint", "bun run typecheck"]
+
+[tasks."web:storybook"]
+description = "Run Storybook on http://localhost:6006 (no API or database needed)"
+dir = "client_application"
+run = "bun run storybook"
+
+[tasks."web:test-storybook"]
+description = "Install Chromium, then run every story's play function"
+dir = "client_application"
+# No --with-deps: the CI runner already has Chromium's libraries, and the extra fonts it adds come from Ubuntu's
+# servers, which can be unreachable. On a fresh Linux machine, run `bunx playwright install-deps chromium` once.
+run = ["bunx playwright install chromium", "bun run test-storybook"]

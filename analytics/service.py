@@ -1,0 +1,276 @@
+"""Read-only normalized-data service supplying the same receipts to API and chat."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime
+from hashlib import sha256
+from pathlib import Path
+
+from analytics import enrollment, graduation, retention
+from analytics.data_access import sqlite_snapshot
+from analytics.execution import check_cancelled
+from analytics.provenance import DataUnavailable
+from analytics.definitions import DEFINITIONS
+from measures.run_measures import configured_data_label
+from analytics.schemas import (
+    AnalysisReceipt,
+    AnalysisRequest,
+    AnalysisResponse,
+    CalculationRow,
+    Clarification,
+)
+from analytics.coverage import Coverage
+from analytics.programs import PROGRAMS, resolve_program
+
+
+class AnalyticsService:
+    """Own deterministic analyses and preserve all calculable aggregate evidence."""
+
+    def __init__(self, database: Path | None, coverage: Coverage, *, connection_factory=None, snapshot_factory=None, bound_snapshot=None):
+        """Use an explicit connection provider or the standalone normalized extract."""
+        self.database = database
+        self.coverage = coverage
+        self.connection_factory = connection_factory
+        self.snapshot_factory = snapshot_factory
+        self.bound_snapshot = bound_snapshot
+
+    @contextmanager
+    def connect(self):
+        """Read one snapshot from the explicit provider or the standalone extract."""
+        if self.bound_snapshot is not None:
+            yield self.bound_snapshot.named
+            return
+        if self.connection_factory is not None:
+            with self.connection_factory() as connection:
+                yield connection
+            return
+        if self.database is None:
+            raise DataUnavailable("No database is configured")
+        with sqlite_snapshot(self.database, require_identity=False) as snapshot:
+            yield snapshot.named
+
+    @contextmanager
+    def snapshot(self):
+        """Open a v2 source with persisted build identity; never fall back across configured factories."""
+        if self.bound_snapshot is not None:
+            yield self.bound_snapshot
+        elif self.snapshot_factory is not None:
+            with self.snapshot_factory() as snapshot:
+                yield snapshot
+        elif self.connection_factory is not None:
+            raise DataUnavailable("The configured provider does not supply shared snapshots.")
+        else:
+            with sqlite_snapshot(self.database) as snapshot:
+                yield snapshot
+
+    def for_snapshot(self, snapshot):
+        """Bind legacy catalog, clarification and analysis calls without taking transaction ownership."""
+        return AnalyticsService(None, self.coverage, bound_snapshot=snapshot)
+
+    def catalog(self) -> dict:
+        """Advertise approved operations, parameter choices and evidence limitations."""
+        cohorts = []
+        try:
+            with self.connect() as db:
+                cohorts = [
+                    r["cohort"]
+                    for r in db.execute(
+                        "SELECT DISTINCT cohort FROM cohort_membership ORDER BY cohort"
+                    )
+                ]
+        except (sqlite3.Error, OSError, DataUnavailable):
+            check_cancelled()
+            if self.bound_snapshot is not None:
+                raise
+            pass
+        return {
+            "analyses": {key: value.model_dump() for key, value in DEFINITIONS.items()},
+            "cohorts": cohorts,
+            "credentials": [
+                {"value": "B", "label": "Bachelor's degree"},
+                {"value": "A", "label": "Associate degree"},
+                {"value": "C", "label": "Certificate"},
+            ],
+            "programs": [
+                {"value": key, "label": value["label"], "codes": sorted(value["codes"])}
+                for key, value in PROGRAMS.items()
+            ],
+            "complete_academic_years": self.coverage.complete_academic_years,
+            "cutoff": self.coverage.cutoff,
+            "coverage_provenance": self.coverage.provenance,
+            "graduation_major_evidence": "Exact award semesters are not present in the starter extract; completion-major results remain unknown.",
+            "source": configured_data_label(),
+        }
+
+    def clarify(self, request: AnalysisRequest) -> Clarification | None:
+        """Require every parameter that materially changes a numerical answer."""
+        catalog = self.catalog()
+        fields = []
+        if request.analysis in ("graduation", "retention"):
+            fields.append(
+                (
+                    "cohort",
+                    "Which entry cohort?",
+                    [{"value": c, "label": c} for c in catalog["cohorts"]],
+                )
+            )
+        if request.analysis == "graduation":
+            fields.extend(
+                [
+                    (
+                        "credential",
+                        "Which credential should completion mean?",
+                        catalog["credentials"],
+                    ),
+                    ("program", "Which chemistry definition?", catalog["programs"]),
+                ]
+            )
+        for field, message, choices in fields:
+            if getattr(request, field) is None:
+                return Clarification(
+                    field=field,
+                    message=message,
+                    choices=[
+                        {"value": c["value"], "label": c["label"]} for c in choices
+                    ],
+                    pending=request,
+                )
+        if (
+            request.cohort is not None
+            and catalog["cohorts"]
+            and request.cohort not in catalog["cohorts"]
+        ):
+            raise ValueError("The selected cohort is not in the loaded extract")
+        if request.program:
+            resolve_program(request.program)
+        return None
+
+    def analyze(self, parameters: AnalysisRequest | dict) -> AnalysisResponse:
+        """Return a clarification or fully projected deterministic receipts."""
+        request = AnalysisRequest.model_validate(parameters)
+        clarification = self.clarify(request)
+        if clarification:
+            return AnalysisResponse(clarification=clarification)
+        definition = DEFINITIONS[request.analysis]
+        receipt = AnalysisReceipt(
+            analysis=request.analysis,
+            parameters=request,
+            definition=definition,
+            rows=[],
+            source=configured_data_label(),
+            cutoff=self.coverage.cutoff,
+            coverage_provenance=self.coverage.provenance,
+            limitations=list(definition.limitations),
+        )
+        try:
+            with self.connect() as db:
+                loaded = db.execute(
+                    "SELECT MAX(loaded_at) AS loaded_at FROM data_provider"
+                ).fetchone()["loaded_at"]
+                loaded = loaded.isoformat() if isinstance(loaded, (date, datetime)) else loaded
+                receipt.loaded_at = loaded
+                providers = [dict(row) for row in db.execute(
+                    "SELECT provider_id, loaded_at, source_file, file_sha256 "
+                    "FROM data_provider ORDER BY provider_id"
+                )]
+                providers = [
+                    {key: value.isoformat() if isinstance(value, (date, datetime)) else value
+                     for key, value in provider.items()} for provider in providers
+                ]
+                fingerprint = sha256(json.dumps(providers, sort_keys=True).encode()).hexdigest()
+                receipt.source_stamp = f"{loaded}:{fingerprint}"
+                if request.analysis == "enrollment":
+                    receipt.academic_years = self.coverage.latest_two_years()
+                    if not receipt.academic_years:
+                        return self.unavailable(
+                            receipt,
+                            "Two complete academic years have not been certified in analytics.yaml.",
+                        )
+                    courses = self.enrollments(db, receipt.academic_years)
+                    receipt.rows = enrollment.calculate(courses, receipt.academic_years)
+                    if not receipt.rows:
+                        return self.unavailable(
+                            receipt,
+                            "No actual course enrollments are available in the declared years.",
+                        )
+                else:
+                    students = [
+                        dict(r)
+                        for r in db.execute(
+                            (
+                                "SELECT program_of_study_term_1, retention FROM cohort_membership WHERE cohort = ?"
+                                if request.analysis == "retention"
+                                else "SELECT * FROM cohort_membership WHERE cohort = ?"
+                            ),
+                            (request.cohort,),
+                        )
+                    ]
+                    if not students:
+                        return self.unavailable(
+                            receipt, "No students are available for this entry cohort.", "empty_population"
+                        )
+                    if request.analysis == "retention":
+                        provisional = (
+                            request.cohort
+                            in self.coverage.provisional_retention_cohorts
+                        )
+                        receipt.rows = retention.calculate(students, provisional)
+                    else:
+                        for student in students:
+                            student["graduation_program"] = None
+                        receipt.program_definition = PROGRAMS[request.program]["label"]
+                        receipt.rows = graduation.calculate(
+                            students,
+                            request.cohort,
+                            request.credential,
+                            resolve_program(request.program),
+                            self.coverage,
+                        )
+                        receipt.limitations.append(
+                            "The extract has no exact award semester. Inferred completion-program attribution is unknown."
+                        )
+                check_cancelled()
+        except (sqlite3.Error, OSError, DataUnavailable):
+            check_cancelled()
+            if self.bound_snapshot is not None:
+                raise
+            return self.unavailable(
+                receipt,
+                "Normalized data is missing or incompatible. Load cohort and course files into the configured database and check its schema.",
+            )
+        return AnalysisResponse(receipts=[receipt])
+
+    @staticmethod
+    def enrollments(db, years: list[str]) -> list[dict]:
+        """Join on student and cohort so repeated cohorts cannot multiply rows."""
+        return [
+            dict(r)
+            for r in db.execute(
+                """
+            SELECT e.student_id, e.course_id, e.term_program_of_study, s.ethnicity, t.academic_year
+            FROM course_enrollment e
+            JOIN cohort_membership m ON m.student_id=e.student_id AND m.cohort=e.cohort
+            JOIN student s ON s.student_id=e.student_id
+            JOIN term t ON t.term_id=e.term_id
+            WHERE e.course_id IS NOT NULL AND t.academic_year IN (?, ?)
+        """,
+                tuple(years),
+            )
+        ]
+
+    @staticmethod
+    def unavailable(receipt: AnalysisReceipt, reason: str, evidence_reason="missing_required_evidence") -> AnalysisResponse:
+        """Represent missing evidence without manufacturing a numerical result."""
+        receipt.rows = [
+            CalculationRow(
+                label=receipt.definition.name,
+                kind="count" if receipt.analysis == "enrollment" else "rate",
+                status="unavailable",
+                note=reason,
+                reason=evidence_reason,
+            )
+        ]
+        return AnalysisResponse(receipts=[receipt])

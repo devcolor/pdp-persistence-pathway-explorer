@@ -1,0 +1,443 @@
+"""The UNCF API: the Explorer pages and one measure by group, on one router under /api/v1/uncf.
+
+Every number comes from the measures package (run_measure and measures/breakdowns/), so the pages, CSV export
+and chat agree.
+
+Every page route and /measures/{measure} take the same cohort bar: cohort, the eight filters (cohort_term,
+enrollment_intensity, enrollment_type, pell, gender, race, ethnicity, age_band) with the measures' value names,
+retention_type (school, the default, or federal), and format (json, the default, or csv).
+e.g. /api/v1/uncf/gateway?cohort=2022-23&pell=Y&retention_type=federal&format=csv
+
+Run it with `python -m api` (port 8001). The Playground server mounts `router` with one line.
+Errors: 422 for a value the API doesn't offer, 404 for a hidden course, 503 when the data isn't loaded or the
+analytics config (UNCF_ANALYTICS_CONFIG) can't be read.
+Our bodies are {"error": {"code", "message"}}.
+"""
+from __future__ import annotations
+
+import csv
+import io
+import os
+from functools import lru_cache
+from typing import Annotated, get_args
+
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+
+from api import data
+from api.analyses import router as analytics_router
+from api.analysis_v2 import router as analysis_v2_router
+from api.measure_by_group import clear_cache as clear_measure_cache
+from api.measure_by_group import is_provisional, measure_by_group
+from gap_finder.gateway import add_gateway_gaps
+from measures.definitions import all_definitions, definition_for
+from api.filters import (
+    DEFAULT_RETENTION_TYPE,
+    FILTER_LABELS,
+    CohortQuery,
+    InvalidFilter,
+    cohort_options,
+)
+from api.schemas import (
+    MAX_GROUP_BY,
+    Cohort,
+    CreditMomentumResponse,
+    DfwCourseResponse,
+    DfwResponse,
+    Dimension,
+    ErrorResponse,
+    GatewayResponse,
+    HealthResponse,
+    Measure,
+    MeasureByGroupMeta,
+    MeasureByGroupResponse,
+    MeasureDefinition,
+    Option,
+    OptionsResponse,
+    StudentPathsResponse,
+)
+from measures import service as measures_service
+from measures.breakdowns.common import page_source
+from measures.registry import OPERATIONS
+from measures.models import min_students
+from measures.breakdowns.dfw_courses import UnknownCourse
+from measures.breakdowns.student_paths import DEFAULT_TERMS
+
+PREFIX = "/api/v1/uncf"
+DEFAULT_PORT = 8001
+DEFAULT_CORS_ORIGINS = "http://localhost:3000"
+ERRORS = {404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 503: {"model": ErrorResponse}}
+# The lists each page's CSV holds, one row per item, with a section column naming the list.
+CSV_SECTIONS = {
+    "student-paths": ("path", "groups"),
+    "dfw": ("courses",),
+    "dfw-course": ("terms", "delivery", "groups"),
+    "gateway": ("courses", "pairs"),
+    "credit-momentum": ("milestones", "terms", "tiers"),
+}
+# Each page's CSV columns, in order, after cohort, filters and retention_type. Every file a page writes has exactly
+# these, whatever the cohort and filters, so a school can import it the same way each time; a value a row doesn't
+# have is blank. api/tests/test_csv_columns.py fails if a page starts returning a field that isn't listed here.
+CSV_COLUMNS: dict[str, tuple[str, ...]] = {
+    "student-paths": (
+        "section", "position", "label", "here", "credential", "elsewhere", "stopped", "anywhere", "not_observed",
+        "shares.here", "shares.credential", "shares.elsewhere", "shares.stopped", "shares.anywhere", "value",
+        "students", "retention.type", "retention.status", "retention.numerator", "retention.denominator",
+        "retention.rate", "retention.n_excluded", "retention.n_out_of_scope", "retention.retained", "retention.students",
+    ),
+    "dfw": (
+        "section", "course", "names.top", "names.distinct", "students", "num", "den", "rate", "split.grades.D",
+        "split.grades.F", "split.grades.W", "split.DF", "split.W", "split.total", "split.shares.D", "split.shares.F",
+        "split.shares.W", "gateway.M", "gateway.E",
+    ),
+    "dfw-course": (
+        "section", "value", "students", "num", "den", "rate", "split.grades.D", "split.grades.F", "split.grades.W",
+        "split.DF", "split.W", "split.total", "split.shares.D", "split.shares.F", "split.shares.W", "rest_rate", "gap",
+        "dimension",
+    ),
+    "gateway": (
+        "section", "course", "name", "subject", "students", "first_pass", "passed", "path.first", "path.retook_passed",
+        "path.retook_not", "path.no_retake", "grades.C or higher", "grades.Below C", "grades.Under 1.0", "grades.P",
+        "grades.W", "retained_if_passed.students", "retained_if_passed.retained", "retained_if_passed.rate",
+        "retained_if_not_passed.students", "retained_if_not_passed.retained", "retained_if_not_passed.rate", "group",
+        "courses", "retained", "rate", "others_rate", "gap", "affected", "likely_noise", "group.status", "group.rate",
+        "group.others_rate", "group.gap", "group.likely_noise",
+    ),
+    "credit-momentum": (
+        "section", "credits", "students", "share", "label", "enrolled", "avg_attempted", "avg_earned", "key",
+        "retained", "rate",
+    ),
+}
+
+# The router answers under /uncf; both apps mount it under /api/v1, so every path is PREFIX + route.
+router = APIRouter(prefix="/uncf", tags=["UNCF"])
+Filter = Annotated[str | None, Query()]
+
+
+def error(status_code: int, code: str, message: str) -> JSONResponse:
+    """The error body every route shares."""
+    return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
+
+
+class Bar:
+    """The cohort bar's query values, checked into a CohortQuery (or a 422), plus the answer's format."""
+
+    def __init__(
+        self,
+        cohort: str | None = None,
+        cohort_term: Filter = None,
+        enrollment_intensity: Filter = None,
+        enrollment_type: Filter = None,
+        pell: Filter = None,
+        gender: Filter = None,
+        race: Filter = None,
+        ethnicity: Filter = None,
+        age_band: Filter = None,
+        retention_type: str = DEFAULT_RETENTION_TYPE,
+        format: str = "json",
+    ) -> None:
+        self.format = format
+        self.problem: JSONResponse | None = None
+        self.query: CohortQuery | None = None
+        if format not in ("json", "csv"):
+            self.problem = error(422, "invalid_filter", f"format has no value {format!r}. Use json or csv.")
+            return
+        filters = {
+            "cohort_term": cohort_term,
+            "enrollment_intensity": enrollment_intensity,
+            "enrollment_type": enrollment_type,
+            "pell": pell,
+            "gender": gender,
+            "race": race,
+            "ethnicity": ethnicity,
+            "age_band": age_band,
+        }
+        try:
+            self.query = CohortQuery.of(cohort, retention_type, **filters)
+        except InvalidFilter as invalid:
+            self.problem = error(422, "invalid_filter", str(invalid))
+        except data.DataMissing as missing:
+            self.problem = error(503, "data_missing", str(missing))
+        except data.ConfigInvalid as invalid:
+            self.problem = error(503, "config_invalid", str(invalid))
+
+
+def run_page(name: str, query: CohortQuery, *extra) -> dict:
+    """Ask measures/breakdowns for one page, then add what every answer says about its question (meta)."""
+    operation_id = {
+        "student-paths": "student_paths.summary", "dfw": "dfw.course_list",
+        "dfw-course": "dfw.course_detail", "gateway": "gateway.course_outcomes",
+        "credit-momentum": "credit_momentum.summary",
+    }[name]
+    parameters = {"cohort": query.cohort, "filters": query.as_dict()}
+    if "retention_type" in OPERATIONS[operation_id].parameters.model_fields:
+        parameters["retention_type"] = query.retention_type
+    if name == "student-paths":
+        terms, group_by = extra
+        parameters.update(terms=terms, group_by=group_by)
+    elif name == "dfw-course":
+        parameters["course"] = extra[0]
+    with page_source(data.data_path()) as snapshot:
+        body = measures_service.execute(operation_id, parameters, snapshot)
+        loaded_at = data.loaded_at(snapshot.named)
+    if name == "gateway":
+        body = add_gateway_gaps(body)
+    context = body.pop("context")
+    return {"meta": {**query.meta(), **context, "loaded_at": loaded_at}, **body}
+
+
+@lru_cache(maxsize=256)
+def cached(name: str, query: CohortQuery, stamp: float, *extra) -> dict:
+    """A page's answer for one query (plus any extra arguments) and one version of the data file."""
+    return run_page(name, query, *extra)
+
+
+def answer(bar: Bar, name: str, *extra):
+    """Run a page for a checked query as JSON or CSV. A bad value is a 422 and missing data is a 503."""
+    if bar.problem is not None:
+        return bar.problem
+    try:
+        body = cached(name, bar.query, data.data_stamp(), *extra)
+    except data.DataMissing as missing:
+        return error(503, "data_missing", str(missing))
+    except data.ConfigInvalid as invalid:
+        return error(503, "config_invalid", str(invalid))
+    except ValueError as invalid:
+        # A value the page doesn't take, such as terms=9 or group_by=housing.
+        return error(422, "invalid_filter", str(invalid))
+    if bar.format == "csv":
+        rows = page_csv_rows(body, CSV_SECTIONS[name])
+        return csv_response(rows, bar.query, f"uncf-{name}-{bar.query.cohort}.csv", CSV_COLUMNS[name])
+    return body
+
+
+def page_csv_rows(body: dict, sections: tuple[str, ...]) -> list[dict]:
+    """Flatten the existing disclosed page objects, including DFW's dimension-keyed group lists."""
+    rows = []
+    for section in sections:
+        items = body.get(section) or []
+        if isinstance(items, dict):
+            for dimension, groups in items.items():
+                rows.extend({"section": section, "dimension": dimension, **flatten(item)} for item in groups)
+        else:
+            rows.extend({"section": section, **flatten(item)} for item in items)
+    return rows
+
+
+def flatten(item: dict, prefix: str = "") -> dict:
+    """One CSV row from a nested answer: {"split": {"D": 3}} becomes {"split.D": 3}. Lists are left out."""
+    row = {}
+    for key, value in item.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            row.update(flatten(value, f"{name}."))
+        elif isinstance(value, (list, tuple, set)):
+            if all(not isinstance(part, (dict, list)) for part in value):
+                row[name] = " + ".join(str(part) for part in value)
+        else:
+            row[name] = value
+    return row
+
+
+def csv_response(rows: list[dict], query: CohortQuery, filename: str, fixed: tuple[str, ...] = ()) -> Response:
+    """Rows as a CSV download. Each row also says which cohort, filters and retention type it is for.
+
+    fixed lists the columns every file has, in order, filled or blank (CSV_COLUMNS). A field outside it still gets a
+    column at the end, so nothing is dropped; the tests fail when that happens, so the list stays complete.
+    """
+    context = {
+        "cohort": query.cohort,
+        "filters": "; ".join(f"{key}={value}" for key, value in query.filters) or "all students",
+        "retention_type": query.retention_type,
+    }
+    rows = [{**context, **row} for row in rows]
+    columns: list[str] = [*context, *fixed]
+    for row in rows:
+        columns.extend(key for key in row if key not in columns)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+# Shared --------------------------------------------------------------------------------------------------------
+
+
+@router.get("/health", response_model=HealthResponse)
+def get_health() -> HealthResponse:
+    """Whether the normalized data is loaded, when, and what kind of data it is (pages show that label)."""
+    try:
+        label = data.data_label()
+    except data.ConfigInvalid:
+        label = None
+    try:
+        data.data_stamp()
+        return HealthResponse(data_available=True, loaded_at=data.loaded_at(), data_label=label)
+    except data.DataMissing:
+        return HealthResponse(data_available=False, loaded_at=None, data_label=label)
+
+
+@router.get("/definitions")
+def get_definitions():
+    """Every plain-language definition (measures/definitions.py), so every page and the chat use the same words."""
+    return {"definitions": all_definitions()}
+
+
+@router.get("/cohort-options", responses=ERRORS)
+def get_cohort_options(cohort: str | None = None):
+    """How many students entered in each cohort year, and how many in the chosen cohort have each filter value."""
+    try:
+        return cohort_options(cohort)
+    except InvalidFilter as invalid:
+        return error(422, "invalid_filter", str(invalid))
+    except data.DataMissing as missing:
+        return error(503, "data_missing", str(missing))
+    except data.ConfigInvalid as invalid:
+        return error(503, "config_invalid", str(invalid))
+
+
+# One measure by group ------------------------------------------------------------------------------------------
+
+GroupByQuery = Annotated[list[Dimension] | None, Query()]
+
+
+@router.get("/measures/{measure}", response_model=MeasureByGroupResponse, responses=ERRORS)
+def get_measure(measure: Measure, cohort: Cohort, bar: Annotated[Bar, Depends()], group_by: GroupByQuery = None):
+    """One measure for one cohort, its filters and retention type: the everyone row, then one row per group."""
+    return measure_answer(measure, cohort, bar, group_by or [])
+
+
+@router.get("/results", response_model=MeasureByGroupResponse, responses=ERRORS, include_in_schema=False)
+def get_results(measure: Measure, cohort: Cohort, bar: Annotated[Bar, Depends()], group_by: GroupByQuery = None):
+    """The old URL for /measures/{measure} (measure as a query value), kept for the deployed API's callers."""
+    return measure_answer(measure, cohort, bar, group_by or [])
+
+
+def measure_answer(measure: str, cohort: str, bar: Bar, dimensions: list[str]):
+    """One measure by group as JSON or CSV, with its definition. A bad group_by is a 422, missing data a 503."""
+    if len(dimensions) > MAX_GROUP_BY:
+        return error(422, "invalid_group_by", f"Pass group_by at most {MAX_GROUP_BY} times.")
+    if len(set(dimensions)) != len(dimensions):
+        return error(422, "invalid_group_by", "Each group_by dimension can be used once.")
+    if bar.problem is not None:
+        return bar.problem
+    try:
+        rows, loaded_at = measure_by_group(measure, bar.query, dimensions)
+        provisional = is_provisional(measure, cohort)
+        label = data.data_label()
+    except data.DataMissing as missing:
+        return error(503, "data_missing", str(missing))
+    except data.ConfigInvalid as invalid:
+        return error(503, "config_invalid", str(invalid))
+
+    if bar.format == "csv":
+        table = [{**{d: row.group.get(d, "All") for d in dimensions}, **flatten(row.model_dump(exclude={"group"}))} for row in rows]
+        return csv_response(table, bar.query, f"uncf-{measure}-{cohort}.csv")
+    federal = measure == "retention" and bar.query.retention_type == "federal"
+    meta = MeasureByGroupMeta(
+        measure=measure,
+        cohort=cohort,
+        group_by=dimensions,
+        filters=bar.query.as_dict(),
+        retention_type=bar.query.retention_type,
+        definition=MeasureDefinition(**definition_for("federal_retention" if federal else measure)),
+        source=data.source(),
+        data_label=label,
+        loaded_at=loaded_at,
+        provisional=provisional,
+        min_students=min_students(),
+    )
+    return MeasureByGroupResponse(meta=meta, rows=rows)
+
+
+@router.get("/options", response_model=OptionsResponse)
+def get_options() -> OptionsResponse:
+    """The measures, classes, groupings and filters /measures/{measure} takes. No cohorts until data is loaded.
+
+    The Explorer's class year picker offers these cohorts and starts on default_cohort, so it follows the loaded data.
+    """
+    try:
+        cohorts = list(data.cohorts())
+    except data.DataMissing:
+        cohorts = []
+    try:
+        default = data.default_cohort() if cohorts else None
+    except data.ConfigInvalid:
+        default = cohorts[-1]  # the pages themselves report the broken config
+    return OptionsResponse(
+        measures=[Option(value=m, label=definition_for(m)["name"]) for m in get_args(Measure)],
+        cohorts=cohorts,
+        default_cohort=default,
+        dimensions=[Option(value=d, label=FILTER_LABELS[d]) for d in get_args(Dimension)],
+        max_group_by=MAX_GROUP_BY,
+    )
+
+
+# Explorer pages ------------------------------------------------------------------------------------------------
+
+
+@router.get("/student-paths", response_model=StudentPathsResponse, responses=ERRORS)
+def get_student_paths(bar: Annotated[Bar, Depends()], terms: int = DEFAULT_TERMS, group_by: str | None = None):
+    """Student paths: each entering student's status term by term, moves, transfers and retention."""
+    return answer(bar, "student-paths", terms, group_by)
+
+
+@router.get("/dfw", response_model=DfwResponse, responses=ERRORS)
+def get_dfw(bar: Annotated[Bar, Depends()]):
+    """DFW list: everyone's DFW rate with D, F and W apart, then each course with min_students() or more students."""
+    return answer(bar, "dfw")
+
+
+@router.get("/dfw/course", response_model=DfwCourseResponse, responses=ERRORS)
+def get_dfw_course(course: str, bar: Annotated[Bar, Depends()]):
+    """One DFW course: its terms, delivery methods and groups, each next to everyone else in the course."""
+    try:
+        return answer(bar, "dfw-course", course)
+    except UnknownCourse as unknown:
+        return error(404, "unknown_course", str(unknown))
+
+
+@router.get("/gateway", response_model=GatewayResponse, responses=ERRORS)
+def get_gateway(bar: Annotated[Bar, Depends()]):
+    """Gateway courses: each course's year 1 path (first try, in the end), retention, group gap and course pairs."""
+    return answer(bar, "gateway")
+
+
+@router.get("/credit-momentum", response_model=CreditMomentumResponse, responses=ERRORS)
+def get_credit_momentum(bar: Annotated[Bar, Depends()]):
+    """Credit momentum: year 1 credits, completion, milestones, the first two terms, credit tiers and retention."""
+    return answer(bar, "credit-momentum")
+
+
+def clear_cache() -> None:
+    """Forget every cached answer: the pages' and the measure route's."""
+    cached.cache_clear()
+    clear_measure_cache()
+
+
+def create_app() -> FastAPI:
+    """The standalone app: the router plus CORS for the Playground client."""
+    app = FastAPI(title="UNCF API", version="2")
+    origins = os.environ.get("UNCF_CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[origin.strip() for origin in origins if origin.strip()],
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
+    @app.exception_handler(HTTPException)
+    async def analysis_error(_request, exception: HTTPException):
+        """Keep the analytics routes' errors in the same error body as every other route."""
+        codes = {404: "not_found", 422: "invalid_analysis", 503: "analytics_unavailable"}
+        return error(exception.status_code, codes.get(exception.status_code, "http_error"), str(exception.detail))
+
+    app.include_router(router, prefix="/api/v1")
+    app.include_router(analytics_router)
+    app.include_router(analysis_v2_router)
+    return app
+
+
+app = create_app()
